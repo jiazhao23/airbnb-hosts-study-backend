@@ -1,0 +1,665 @@
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+import os
+import pandas as pd
+import numpy as np
+from fastapi.responses import JSONResponse
+import hashlib
+import json
+from pathlib import Path
+from datetime import datetime
+import h3
+from typing import List, Dict
+from math import sqrt
+
+app = FastAPI()
+
+# 添加 CORS 中间件配置
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173"],  # 确保这个和你的前端端口匹配
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+    expose_headers=["*"]  # 添加这行
+)
+
+DATA_DIR = "data-airbnb"
+ALL_CITY_FILE = os.path.join(DATA_DIR, "all_city.parquet")
+HASH_FILE = os.path.join(DATA_DIR, "folder_hash.json")
+
+def calculate_folder_hash():
+    """计算每个城市文件夹中 listings.csv.gz 的哈希值"""
+    folder_hashes = {}
+    for city in os.listdir(DATA_DIR):
+        city_path = os.path.join(DATA_DIR, city)
+        if os.path.isdir(city_path):
+            listings_file = os.path.join(city_path, "listings.csv.gz")
+            if os.path.exists(listings_file):
+                with open(listings_file, 'rb') as f:
+                    folder_hashes[city] = hashlib.md5(f.read()).hexdigest()
+    return folder_hashes
+
+def load_previous_hashes():
+    """加载上次保存的哈希值"""
+    if os.path.exists(HASH_FILE):
+        with open(HASH_FILE, 'r') as f:
+            return json.load(f)
+    return {}
+
+def save_current_hashes(hashes):
+    """保存当前的哈希值"""
+    with open(HASH_FILE, 'w') as f:
+        json.dump(hashes, f)
+
+def integrate_city_data(city_name):
+    """整合单个城市的数据"""
+    listings_file = os.path.join(DATA_DIR, city_name, "listings.csv.gz")
+    if not os.path.exists(listings_file):
+        return None
+    
+    # 读取所有列，不再指定 usecols
+    df = pd.read_csv(
+        listings_file,
+        low_memory=False
+    )
+    
+    # 数据清理 - 修复 str.replace 警告
+    if 'price' in df.columns:
+        df['price'] = (df['price']
+                      .str.replace('$', '', regex=False)
+                      .str.replace(',', '', regex=False)
+                      .astype('float64'))
+    
+    if 'first_review' in df.columns:
+        df['first_review'] = pd.to_datetime(df['first_review'])
+    
+    # 添加城市列
+    df['city'] = city_name
+    
+    return df
+
+def update_all_city_data():
+    """更新整合后的数据文件"""
+    current_hashes = calculate_folder_hash()
+    previous_hashes = load_previous_hashes()
+    
+    if os.path.exists(ALL_CITY_FILE) and current_hashes == previous_hashes:
+        print("No changes detected, using existing all_city file")
+        return
+    
+    all_cities = []
+    if os.path.exists(ALL_CITY_FILE):
+        # 加载现有数据
+        existing_data = pd.read_parquet(ALL_CITY_FILE)
+        
+        for city in os.listdir(DATA_DIR):
+            if os.path.isdir(os.path.join(DATA_DIR, city)):
+                if city not in previous_hashes or current_hashes.get(city) != previous_hashes.get(city):
+                    existing_data = existing_data[existing_data['city'] != city]
+                    city_data = integrate_city_data(city)
+                    if city_data is not None:
+                        all_cities.append(city_data)
+        
+        if all_cities:
+            all_cities.append(existing_data)
+    else:
+        for city in os.listdir(DATA_DIR):
+            if os.path.isdir(os.path.join(DATA_DIR, city)):
+                city_data = integrate_city_data(city)
+                if city_data is not None:
+                    all_cities.append(city_data)
+    
+    if all_cities:
+        final_df = pd.concat(all_cities, ignore_index=True)
+        # 使用 Parquet 格式保存，并进行优化
+        final_df.to_parquet(
+            ALL_CITY_FILE,
+            engine='fastparquet',
+            compression='snappy',  # 快速压缩
+            index=False
+        )
+        save_current_hashes(current_hashes)
+
+# 应用启动时更新数据
+@app.on_event("startup")
+async def startup_event():
+    update_all_city_data()
+
+# 修改后的 API 端点
+@app.get("/cities")
+async def get_cities():
+    try:
+        print(f"Reading cities from: {ALL_CITY_FILE}")
+        if not os.path.exists(ALL_CITY_FILE):
+            print(f"Warning: {ALL_CITY_FILE} does not exist!")
+            # 如果文件不存在，回退到直接读取文件夹
+            cities = [name for name in os.listdir(DATA_DIR) 
+                     if os.path.isdir(os.path.join(DATA_DIR, name))]
+            return {"cities": cities}
+            
+        df = pd.read_parquet(ALL_CITY_FILE, columns=['city'])
+        cities = df['city'].unique().tolist()
+        print(f"Found cities: {cities}")
+        return {"cities": cities}
+    except Exception as e:
+        print(f"Error in get_cities: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/city/{city_name}")
+async def get_city_listings(city_name: str):
+    try:
+        # 只读取需要的列
+        df = pd.read_parquet(
+            ALL_CITY_FILE,
+            filters=[('city', '=', city_name)]  # 使用 Parquet 的过滤功能
+        )
+        
+        if len(df) == 0:
+            raise HTTPException(status_code=404, detail=f"City not found: {city_name}")
+        
+        # 计算时间窗
+        valid_reviews = df['first_review'].dropna()
+        time_window = {
+            'earliest': valid_reviews.min().strftime('%Y-%m-%d') if not valid_reviews.empty else None,
+            'latest': valid_reviews.max().strftime('%Y-%m-%d') if not valid_reviews.empty else None
+        }
+         
+        valid_mask = df[['latitude', 'longitude']].notna().all(axis=1)
+        valid_coords = df[valid_mask][['latitude', 'longitude']]
+        
+        if len(valid_coords) == 0:
+            raise HTTPException(status_code=500, detail="No valid coordinates found")
+        
+        center = {
+            'latitude': float(valid_coords['latitude'].to_numpy().mean()),
+            'longitude': float(valid_coords['longitude'].to_numpy().mean())
+        }
+        
+        return {
+            "center": center,
+            "time_window": time_window
+        }
+        
+    except HTTPException as he:
+        raise he
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) 
+
+@app.get("/city/{city_name}/host_ranking")
+async def get_host_ranking(city_name: str, time_point: str):
+    try:
+        print(f"Received request for city: {city_name}, time_point: {time_point}")
+        
+        df = pd.read_parquet(
+            ALL_CITY_FILE,
+            filters=[('city', '=', city_name)]
+        )
+        print(f"Found {len(df)} records for {city_name}")
+        
+        if len(df) == 0:
+            raise HTTPException(status_code=404, detail=f"City not found: {city_name}")
+        
+        try:
+            target_date = datetime.strptime(time_point, "%Y-%m")
+            print(f"Successfully parsed date to: {target_date}")
+        except ValueError as ve:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid time format: {str(ve)}. Please use YYYY-MM format (e.g., 2021-08)"
+            )
+        
+        # 数据筛选
+        valid_df = df.dropna(subset=['first_review', 'host_id'])
+        filtered_df = valid_df[valid_df['first_review'] <= target_date]
+        
+        if len(filtered_df) == 0:
+            return {
+                "host_categories": {},
+                "total_hosts": 0,
+                "total_listings": 0
+            }
+        
+        # 计算每个房东的房源数量
+        host_counts = (filtered_df.groupby('host_id')
+                      .size()
+                      .sort_values(ascending=False)
+                      .reset_index(name='listing_count'))
+        
+        total_hosts = len(host_counts)
+        
+        # 分类处理
+        # 第5类：listing_count = 1
+        class_5 = host_counts[host_counts['listing_count'] == 1]
+        # 第4类：listing_count = 2
+        class_4 = host_counts[host_counts['listing_count'] == 2]
+        
+        # 剩余的房东（listing_count > 2）
+        remaining_hosts = host_counts[host_counts['listing_count'] > 2]
+        
+        if len(remaining_hosts) > 0:
+            # 确保至少有一个房东在每个类别中
+            p5_index = max(1, int(len(remaining_hosts) * 0.05))
+            p15_index = max(p5_index + 1, int(len(remaining_hosts) * 0.15))
+            
+            # 第1类：前5%（至少1个）
+            class_1 = remaining_hosts.iloc[:p5_index]
+            # 第2类：5%-15%（至少1个）
+            class_2 = remaining_hosts.iloc[p5_index:p15_index]
+            # 第3类：剩余的
+            class_3 = remaining_hosts.iloc[p15_index:]
+            
+            # 如果第2类为空，将其合并到第1类
+            if len(class_2) == 0 and len(class_1) > 0:
+                class_1 = remaining_hosts.iloc[:p15_index]
+                class_2 = pd.DataFrame()
+        else:
+            class_1 = pd.DataFrame()
+            class_2 = pd.DataFrame()
+            class_3 = pd.DataFrame()
+        
+        # 构建返回结果
+        def get_category_info(df):
+            if len(df) == 0:
+                return {
+                    "range": None,
+                    "count": 0,
+                    "host_ids": []
+                }
+            min_val = int(df['listing_count'].min())
+            max_val = int(df['listing_count'].max())
+            return {
+                "range": {"min": min_val, "max": max_val},
+                "count": len(df),
+                "host_ids": df['host_id'].tolist()  # 添加 host_ids
+            }
+        
+        host_categories = {
+            "highly_commercial": get_category_info(class_1),  # 第1类：前5%
+            "commercial": get_category_info(class_2),  # 第2类：5%-15%
+            "semi_commercial": get_category_info(class_3),  # 第3类：其余多房源
+            "dual_host": {  # 第4类：2个房源
+                "range": {"min": 2, "max": 2},
+                "count": len(class_4),
+                "host_ids": class_4['host_id'].tolist()
+            },
+            "single_host": {  # 第5类：1个房源
+                "range": {"min": 1, "max": 1},
+                "count": len(class_5),
+                "host_ids": class_5['host_id'].tolist()
+            }
+        }
+        
+        return {
+            "host_categories": host_categories,
+            "total_hosts": int(total_hosts),
+            "total_listings": int(filtered_df['host_id'].count())
+        }
+        
+    except HTTPException as he:
+        raise he
+    except Exception as e:
+        print(f"Unexpected error: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e)) 
+
+@app.get("/city/{city_name}/listings_by_categories")
+async def get_listings_by_categories(
+    city_name: str, 
+    time_point: str, 
+    categories: str
+):
+    try:
+        print(f"Received request - city: {city_name}, time: {time_point}, categories: {categories}")
+        
+        # 只读取需要的列
+        needed_columns = ['city', 'host_id', 'first_review', 'latitude', 'longitude', 'name', 'price']
+        df = pd.read_parquet(
+            ALL_CITY_FILE,
+            columns=needed_columns,
+            filters=[('city', '=', city_name.replace(" ", ""))]
+        )
+        
+        if len(df) == 0:
+            return {"listings": [], "total_listings": 0}
+        
+        # 一次性处理所有数据转换
+        df['first_review'] = pd.to_datetime(df['first_review'])
+        target_date = datetime.strptime(time_point, "%Y-%m")
+        
+        # 使用 query 进行过滤
+        mask = (
+            df['first_review'].notna() & 
+            (df['first_review'] <= target_date) &
+            df['host_id'].notna() & 
+            df['latitude'].notna() & 
+            df['longitude'].notna()
+        )
+        filtered_df = df[mask]
+        
+        # 计算房东分类
+        host_counts = filtered_df.groupby('host_id').size()
+        
+        # 使用 numpy 操作进行分类
+        host_categories = {}
+        
+        # 单房源和双房源
+        single_hosts = set(host_counts[host_counts == 1].index)
+        dual_hosts = set(host_counts[host_counts == 2].index)
+        
+        # 处理多房源
+        multi_hosts = host_counts[host_counts > 2].sort_values(ascending=False)
+        if len(multi_hosts) > 0:
+            p5_count = max(1, int(len(multi_hosts) * 0.05))
+            p15_count = max(p5_count + 1, int(len(multi_hosts) * 0.15))
+            
+            highly_commercial = set(multi_hosts.index[:p5_count])
+            commercial = set(multi_hosts.index[p5_count:p15_count])
+            semi_commercial = set(multi_hosts.index[p15_count:])
+        else:
+            highly_commercial = set()
+            commercial = set()
+            semi_commercial = set()
+        
+        # 创建类别映射
+        category_map = {
+            "highly_commercial": highly_commercial,
+            "commercial": commercial,
+            "semi_commercial": semi_commercial,
+            "dual_host": dual_hosts,
+            "single_host": single_hosts
+        }
+        
+        # 获取选中类别的房东
+        selected_hosts = set().union(*(
+            category_map[cat] for cat in categories.split(',')
+            if cat in category_map
+        ))
+        
+        if not selected_hosts:
+            return {"listings": [], "total_listings": 0}
+        
+        # 筛选房源并处理特殊值
+        final_df = filtered_df[filtered_df['host_id'].isin(selected_hosts)].copy()
+        
+        # 使用 vectorized 操作处理数据
+        final_df['host_id'] = final_df['host_id'].astype(str)
+        final_df['name'] = final_df['name'].fillna('').astype(str)
+        final_df['price'] = pd.to_numeric(final_df['price'], errors='coerce').fillna(0)
+        
+        # 过滤无效值
+        valid_mask = (
+            ~final_df['latitude'].isin([np.inf, -np.inf]) &
+            ~final_df['longitude'].isin([np.inf, -np.inf]) &
+            ~final_df['price'].isin([np.inf, -np.inf])
+        )
+        final_df = final_df[valid_mask]
+        
+        # 直接转换为列表
+        listings_data = final_df[[
+            'host_id', 'latitude', 'longitude', 'name', 'price'
+        ]].to_dict('records')
+        
+        return {
+            "listings": listings_data,
+            "total_listings": len(listings_data)
+        }
+        
+    except ValueError as ve:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid time format: {str(ve)}. Please use YYYY-MM format."
+        )
+    except Exception as e:
+        print(f"Error: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e)) 
+
+@app.get("/city/{city_name}/hexgrid")
+async def get_city_hexgrid(
+    city_name: str,
+    time_point: str = None,
+    categories: str = None
+):
+    try:
+        # 读取所需的列
+        needed_columns = ['city', 'latitude', 'longitude', 'host_id', 'first_review']
+        df = pd.read_parquet(
+            ALL_CITY_FILE,
+            columns=needed_columns,
+            filters=[('city', '=', city_name)]
+        )
+        
+        if len(df) == 0:
+            raise HTTPException(status_code=404, detail=f"City not found: {city_name}")
+        
+        # 过滤无效坐标
+        valid_coords = df.dropna(subset=['latitude', 'longitude'])
+        
+        # 如果提供了时间和类别参数，进行额外的筛选
+        if time_point and categories:
+            try:
+                target_date = datetime.strptime(time_point, "%Y-%m")
+                
+                # 筛选时间
+                valid_coords = valid_coords.dropna(subset=['first_review', 'host_id'])
+                valid_coords['first_review'] = pd.to_datetime(valid_coords['first_review'])
+                valid_coords = valid_coords[valid_coords['first_review'] <= target_date]
+                
+                # 使用向量化操作计算房东分类
+                host_counts = valid_coords.groupby('host_id').size()
+                
+                # 快速分类
+                single_hosts = set(host_counts[host_counts == 1].index)
+                dual_hosts = set(host_counts[host_counts == 2].index)
+                multi_hosts = host_counts[host_counts > 2]
+                
+                if len(multi_hosts) > 0:
+                    sorted_multi = multi_hosts.sort_values(ascending=False)
+                    p5_count = max(1, int(len(sorted_multi) * 0.05))
+                    p15_count = max(p5_count + 1, int(len(sorted_multi) * 0.15))
+                    
+                    selected_categories = set(categories.split(','))
+                    selected_hosts = set()
+                    
+                    if 'highly_commercial' in selected_categories:
+                        selected_hosts.update(sorted_multi.index[:p5_count])
+                    if 'commercial' in selected_categories:
+                        selected_hosts.update(sorted_multi.index[p5_count:p15_count])
+                    if 'semi_commercial' in selected_categories:
+                        selected_hosts.update(sorted_multi.index[p15_count:])
+                    if 'dual_host' in selected_categories:
+                        selected_hosts.update(dual_hosts)
+                    if 'single_host' in selected_categories:
+                        selected_hosts.update(single_hosts)
+                    
+                    valid_coords = valid_coords[valid_coords['host_id'].isin(selected_hosts)]
+            
+            except ValueError as ve:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Invalid time format: {str(ve)}. Please use YYYY-MM format."
+                )
+        
+        if len(valid_coords) == 0:
+            raise HTTPException(status_code=500, detail="No valid coordinates found")
+        
+        # 计算边界
+        bounds = {
+            'min_lat': float(valid_coords['latitude'].min()),
+            'max_lat': float(valid_coords['latitude'].max()),
+            'min_lng': float(valid_coords['longitude'].min()),
+            'max_lng': float(valid_coords['longitude'].max())
+        }
+        
+        # 使用 numpy 数组进行批量计算
+        coords = valid_coords[['latitude', 'longitude']].values
+        resolution = 9
+        
+        # 批量计算 hex_ids
+        hex_ids = [h3.latlng_to_cell(lat, lng, resolution) for lat, lng in coords]
+        
+        # 使用 Counter 计算每个六边形内的点数
+        from collections import Counter
+        hex_counts = Counter(hex_ids)
+        
+        # 预计算所有唯一六边形的边界和中心
+        hex_boundaries = []
+        for hex_id, count in hex_counts.items():
+            boundary = h3.cell_to_boundary(hex_id)
+            center = h3.cell_to_latlng(hex_id)
+            
+            hex_boundaries.append({
+                'id': str(hex_id),
+                'boundary': [list(point) for point in boundary],
+                'center': list(center),
+                'points_count': count
+            })
+        
+        return {
+            'hexagons': hex_boundaries,
+            'bounds': bounds,
+            'total_hexagons': len(hex_counts),
+            'total_points': len(valid_coords)
+        }
+        
+    except Exception as e:
+        print(f"Error generating hexgrid: {str(e)}")
+        import traceback
+        print(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=str(e)) 
+
+@app.get("/city/{city_name}/yearly_stats")
+async def get_yearly_stats(city_name: str):
+    try:
+        # 读取所需的列
+        needed_columns = ['city', 'host_id', 'first_review']
+        df = pd.read_parquet(
+            ALL_CITY_FILE,
+            columns=needed_columns,
+            filters=[('city', '=', city_name)]
+        )
+        
+        if len(df) == 0:
+            raise HTTPException(status_code=404, detail=f"City not found: {city_name}")
+        
+        # 确保数据有效，使用 copy() 避免 SettingWithCopyWarning
+        valid_df = df.dropna(subset=['first_review', 'host_id']).copy()
+        valid_df['first_review'] = pd.to_datetime(valid_df['first_review'])
+        
+        # 获取年份范围
+        min_year = valid_df['first_review'].dt.year.min()
+        max_year = valid_df['first_review'].dt.year.max()
+        
+        yearly_stats = {}
+        
+        # 对每一年进行统计（除了第一年）
+        for year in range(min_year + 1, max_year + 1):
+            # 截止到当年年底的数据
+            year_end = f"{year}-12-31"
+            filtered_df = valid_df[valid_df['first_review'] <= year_end]
+            
+            # 计算房东分类
+            host_counts = filtered_df.groupby('host_id').size()
+            
+            # 单房源和双房源房东
+            single_hosts = host_counts[host_counts == 1]
+            dual_hosts = host_counts[host_counts == 2]
+            
+            # 处理多房源房东
+            multi_hosts = host_counts[host_counts > 2].sort_values(ascending=False)
+            
+            # 初始化变量
+            p5_count = 0
+            p15_count = 0
+            highly_commercial = pd.Series(dtype=int)
+            commercial = pd.Series(dtype=int)
+            semi_commercial = pd.Series(dtype=int)
+            
+            # 计算分类阈值和统计
+            stats = {
+                "thresholds": {
+                    "single_host": {"min": 1, "max": 1},
+                    "dual_host": {"min": 2, "max": 2}
+                },
+                "counts": {
+                    "single_host": len(single_hosts),
+                    "dual_host": len(dual_hosts)
+                }
+            }
+            
+            # 处理多房源房东
+            if len(multi_hosts) > 0:
+                p5_count = max(1, int(len(multi_hosts) * 0.05))
+                p15_count = max(p5_count + 1, int(len(multi_hosts) * 0.15))
+                
+                highly_commercial = multi_hosts.iloc[:p5_count]
+                commercial = multi_hosts.iloc[p5_count:p15_count]
+                semi_commercial = multi_hosts.iloc[p15_count:]
+                
+                # 记录阈值
+                stats["thresholds"].update({
+                    "highly_commercial": {
+                        "min": int(highly_commercial.min()) if len(highly_commercial) > 0 else None,
+                        "max": int(highly_commercial.max()) if len(highly_commercial) > 0 else None
+                    },
+                    "commercial": {
+                        "min": int(commercial.min()) if len(commercial) > 0 else None,
+                        "max": int(commercial.max()) if len(commercial) > 0 else None
+                    },
+                    "semi_commercial": {
+                        "min": int(semi_commercial.min()) if len(semi_commercial) > 0 else None,
+                        "max": int(semi_commercial.max()) if len(semi_commercial) > 0 else None
+                    }
+                })
+            else:
+                # 如果没有多房源房东，设置默认值
+                stats["thresholds"].update({
+                    "highly_commercial": {"min": None, "max": None},
+                    "commercial": {"min": None, "max": None},
+                    "semi_commercial": {"min": None, "max": None}
+                })
+            
+            # 更新计数
+            stats["counts"].update({
+                "highly_commercial": len(highly_commercial),
+                "commercial": len(commercial),
+                "semi_commercial": len(semi_commercial)
+            })
+            
+            # 计算百分比
+            total_hosts = sum(stats["counts"].values())
+            stats["percentages"] = {
+                category: round(count / total_hosts * 100, 2)
+                for category, count in stats["counts"].items()
+            }
+            
+            # 计算房源数量
+            stats["listing_counts"] = {
+                "single_host": stats["counts"]["single_host"],
+                "dual_host": stats["counts"]["dual_host"] * 2,
+                "highly_commercial": int(highly_commercial.sum()) if len(highly_commercial) > 0 else 0,
+                "commercial": int(commercial.sum()) if len(commercial) > 0 else 0,
+                "semi_commercial": int(semi_commercial.sum()) if len(semi_commercial) > 0 else 0
+            }
+            
+            # 计算房源占比
+            total_listings = sum(stats["listing_counts"].values())
+            stats["listing_percentages"] = {
+                category: round(count / total_listings * 100, 2)
+                for category, count in stats["listing_counts"].items()
+            }
+            
+            yearly_stats[str(year)] = stats
+        
+        return {
+            "yearly_stats": yearly_stats,
+            "year_range": {
+                "start": min_year + 1,
+                "end": max_year
+            }
+        }
+        
+    except Exception as e:
+        print(f"Error generating yearly stats: {str(e)}")
+        import traceback
+        print(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=str(e))

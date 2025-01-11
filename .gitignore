@@ -1,0 +1,14 @@
+# 数据文件
+data-airbnb/
+*.csv
+*.csv.gz
+*.parquet
+
+# Python
+__pycache__/
+*.pyc
+
+# 备份文件
+*.bak
+*.backup
+node_modules/
